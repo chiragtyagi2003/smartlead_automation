@@ -3,21 +3,21 @@ import pandas as pd
 import datetime
 import google.generativeai as genai
 import os
-import firebase_admin
-from firebase_admin import credentials, firestore
+import pymysql
+from dateutil import parser  # Import parser for string to datetime conversion
+import requests
 
-# Initialize Firebase Admin SDK if not already initialized
-if not firebase_admin._apps:
-    cred = credentials.Certificate("smartlead_creds.json")
-    firebase_admin.initialize_app(cred)
+# Database connection details
+db_host = 'rdsmain.cf4sfdz8regx.ap-south-1.rds.amazonaws.com'
+db_user = 'qubit_automation'     # Replace with your RDS username
+db_password = 'newpassword'    # Replace with your RDS password
+db_name = 'qubit_automation_db'   # Replace with your database name
 
-# Initialize Firestore client
-db = firestore.client()
-
+# Initialize Google Generative AI
 API_KEY = os.getenv("gen_API_Key")
 genai.configure(api_key=API_KEY)
-
 model = genai.GenerativeModel('gemini-1.5-flash')
+SMARTLEAD_API_KEY = os.getenv("smartlead_api_key")
 
 # Categories for email classification
 Categories = [
@@ -36,28 +36,64 @@ Categories = [
 ]
 Categories_string = ', '.join(Categories)
 
-# Function to fetch emails from Firestore
-def fetch_emails_from_firestore():
-    emails_ref = db.collection('emails')  # Assuming your collection is named 'emails'
-    docs = emails_ref.stream()
+
+
+# Function to fetch emails from AWS RDS
+def fetch_emails_from_rds():
     email_data = []
-    for doc in docs:
-        data = doc.to_dict()
-        timestamp = data.get("time_replied")
-        if timestamp:
-            # Convert Firestore timestamp to Python datetime
-            date = datetime.datetime.fromtimestamp(timestamp.timestamp()).strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Default to current date if not provided
-        email_data.append({
-            "sender_email": data.get("to_email"),
-            "email_content": data.get("reply_message_text"),
-            "date": date
-        })
+    # Establish a connection to the RDS database
+    connection = pymysql.connect(
+        host=db_host,
+        user=db_user,
+        password=db_password,
+        database=db_name,
+        cursorclass=pymysql.cursors.DictCursor
+    )
+    
+    try:
+        with connection.cursor() as cursor:
+            # Fetch the last 10 emails, ordered by event_timestamp or another appropriate column
+            sql_query = """
+                SELECT to_email, reply_message_text, event_timestamp, stats_id, datetime, campaign_id
+                FROM smartlead_campaign_emails
+                ORDER BY event_timestamp DESC
+                LIMIT 10
+                """
+
+            cursor.execute(sql_query)
+            results = cursor.fetchall()
+
+            # Process the fetched results
+            for row in results:
+                timestamp = row.get("event_timestamp")
+                if timestamp:
+                    try:
+                        # Parse the string timestamp to a datetime object
+                        date = parser.parse(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                    except (ValueError, TypeError):
+                        # Handle invalid timestamp formats
+                        date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                email_data.append({
+                    "sender_email": row.get("to_email"),
+                    "email_content": row.get("reply_message_text"),
+                    "date": date,
+                    "stats_id": row.get("stats_id"),
+                    # "message_id": row.get("message_id"),
+                    # "email_body": row.get("email_body"),
+                    "time": row.get("datetime"),
+                    "campaign_id": row.get("campaign_id")  # Added this line
+                })
+
+    finally:
+        connection.close()
+    
     return email_data
 
+
 # Fetch emails
-email_data = fetch_emails_from_firestore()
+email_data = fetch_emails_from_rds()
 
 # Convert the list of dictionaries to a DataFrame
 emails_df = pd.DataFrame(email_data)
@@ -75,6 +111,24 @@ selected_email_index = st.sidebar.selectbox(
     range(len(email_list)), 
     format_func=lambda x: f"{email_list[x]['sender_email']} - {email_list[x]['date']}"
 )
+
+
+def prepare_payload(email_details, generated_reply):
+    payload = {
+        "email_stats_id": email_details["stats_id"],
+        "email_body": generated_reply,
+        # "reply_message_id": email_details["message_id"],
+        # "reply_email_time": email_details["time"],
+        # "reply_email_body": email_details["email_body"],
+        "cc": "chiragtyagi2025@gmail.com",
+        "bcc": "chirag.tyagi@qubit.capital",
+        "add_signature": True,
+        "to_first_name": "chirag",
+        "to_last_name": "tyagi",
+        "to_email": "tyagichirag2025@gmail.com" # for testing purpose
+        # "to_email": email_details["sender_email"]
+    }
+    return payload
 
 # Display selected email details
 selected_email = email_list[selected_email_index]
@@ -127,9 +181,40 @@ def feedback_and_comparison(feedback_score, benchmark_score):
     return feedback_score >= benchmark_score
 
 # Function to send email
-def send_email(response, recipient_info):
-    # Dummy sending logic
-    st.write(f"Sending email to {recipient_info}: {response}")
+def send_reply_email(payload, campaign_id):
+    url = f"https://server.smartlead.ai/api/v1/campaigns/{campaign_id}/reply-email-thread?api_key={SMARTLEAD_API_KEY}"
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        
+        # Log the response status and headers
+        print(f"Status Code: {response.status_code}")
+        print("Response Headers:")
+        for key, value in response.headers.items():
+            print(f"{key}: {value}")
+        
+        # Check if the request was successful
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError:
+                # Log the entire response for debugging
+                print("Error: Response is not in JSON format.")
+                print("Response Content:")
+                print(response.text)
+                return None
+        else:
+            # Log the entire response for non-200 status codes
+            print(f"Error: {response.status_code}")
+            print("Response Content:")
+            print(response.text)
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed: {e}")
+        return None
 
 # Display selected email details in the main area
 st.subheader("Selected Email Details")
@@ -158,7 +243,11 @@ else:
     st.error("Response does not meet the benchmark score. Consider editing or regenerating the response.")
 
 if st.button("Send Response", key="send_response"):
-    send_email(response_text, selected_email["sender_email"])
+    payload = prepare_payload(selected_email, response_text)
+    campaign_id = selected_email["campaign_id"]
+    response = send_reply_email(payload, campaign_id)
+    st.write(response)
+
 
 # Display follow-up emails
 st.subheader("Follow-Up Emails")
