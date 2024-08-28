@@ -4,3 +4,4 @@ google-generativeai
 pymysql
 python-dateutil
 requests
+fireabase-admin

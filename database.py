@@ -1,11 +1,14 @@
 import pymysql
 from dateutil import parser  # Import parser for string to datetime conversion
 import datetime
+import os
 
-db_host = 'rdsmain.cf4sfdz8regx.ap-south-1.rds.amazonaws.com'
-db_user = 'qubit_automation'     # Replace with your RDS username
-db_password = 'newpassword'    # Replace with your RDS password
-db_name = 'qubit_automation_db'   # Replace with your database name
+
+# Fetch database credentials from environment variables
+db_host = os.getenv('DB_HOST')
+db_user = os.getenv('DB_USER')
+db_password = os.getenv('DB_PASSWORD')
+db_name = os.getenv('DB_NAME')
 
 def fetch_emails_from_rds():
     email_data = []
